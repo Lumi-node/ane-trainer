@@ -16,96 +16,133 @@
 
 ---
 
-ANE Trainer is a proof-of-concept framework designed to bridge the gap between standard deep learning training workflows and the specialized inference capabilities of Apple's Neural Engine (ANE). It aims to allow developers to train lightweight neural networks directly targeting ANE hardware, circumventing the typical inference-only use case.
+ANE Trainer is a proof-of-concept framework exploring the gap between standard deep learning training workflows and the specialized inference capabilities of Apple's Neural Engine (ANE). It provides a clean MNIST training pipeline with Apple Silicon detection and a forward-pass abstraction layer designed for future ANE acceleration.
 
-This project serves as an exploration into reverse-engineering and utilizing low-level ANE APIs within a high-level Python environment. While currently a skeleton, it demonstrates the architectural approach required to orchestrate data loading, model definition, and hardware-accelerated training loops.
+**Current status:** ANE hardware training is **experimental/placeholder**. The `ane_forward_pass` function detects Apple Silicon but currently falls back to CPU execution in all cases. The ANE hardware path is stubbed for future implementation via reverse-engineered APIs. On non-Apple hardware, everything runs on CPU via PyTorch.
 
 ---
 
 ## Quick Start
 
-First, install the package:
+Install the package:
 
 ```bash
 pip install ane_trainer
 ```
 
-To run the training pipeline using the CLI:
+Train an MNIST model via the CLI (no subcommands -- all arguments are flags):
 
 ```bash
-ane_trainer train --dataset mnist --epochs 5
+python -m ane_trainer --dataset ./mnist_data --epochs 5 --output model.pt
+python -m ane_trainer --dataset ./mnist_data --epochs 10 --output model.pt --batch-size 64 --learning-rate 0.005
 ```
 
-A basic usage example demonstrating model definition and data loading:
+Or use the Python API directly:
 
 ```python
+import numpy as np
+import torch
 from ane_trainer.models import build_model
 from ane_trainer.data import load_dataset
+from ane_trainer.core import train_step
 
-# Load MNIST dataset
-dataset = load_dataset('mnist')
+# Load MNIST dataset (downloads on first run)
+X_train, y_train, X_test, y_test = load_dataset("./mnist_data")
+# X_train: (60000, 28, 28) float32, y_train: (60000,) int64
 
-# Build a simple 3-layer network
-model = build_model(input_size=784, output_size=10)
+# Build a 2-layer feedforward network (all 3 args required)
+model = build_model(input_size=784, hidden_size=128, output_size=10)
 
-print("Model built successfully.")
+# Set up optimizer and loss
+optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+loss_fn = torch.nn.CrossEntropyLoss()
+
+# Flatten images and run one training step
+x_batch = X_train[:32].reshape(32, 784).astype(np.float32)
+y_batch = y_train[:32]
+loss = train_step(model, x_batch, y_batch, optimizer, loss_fn)
+print(f"Loss: {loss:.4f}")
 ```
 
 ## What Can You Do?
 
-### Train on ANE Hardware
-The core functionality allows the training process to be orchestrated to leverage the ANE for forward and backward passes, simulating a full training loop on specialized hardware.
+### Train MNIST Models
+The training pipeline handles data loading, batching, and SGD optimization. Training runs on CPU (with Apple Silicon detection for future ANE acceleration).
 
 ```python
 from ane_trainer.core import train_step
 
-# Assuming model and data are loaded
-loss, metrics = train_step(model, data_batch)
+# train_step takes 5 arguments and returns a scalar loss (float)
+loss = train_step(model, x_batch, y_batch, optimizer, loss_fn)
 print(f"Loss: {loss:.4f}")
 ```
 
-### Define and Load Datasets
-The `data` module provides utilities to fetch and preprocess standard datasets like MNIST, preparing them for the ANE pipeline.
+### ANE-Aware Forward Pass
+The `ane_forward_pass` function provides a hardware abstraction layer. It detects Apple Silicon and is designed to route computation to the ANE in a future release. Currently, it executes on CPU in all cases.
+
+```python
+from ane_trainer.core import ane_forward_pass
+
+# x must be numpy float32, shape (batch_size, 784)
+logits = ane_forward_pass(model, x_batch)  # returns numpy float32, shape (batch_size, 10)
+```
+
+### Load and Cache Datasets
+The `data` module downloads and caches MNIST via torchvision. Pass a filesystem path (not a dataset name).
 
 ```python
 from ane_trainer.data import load_dataset
-mnist_data = load_dataset('mnist')
-print(f"Dataset loaded with {len(mnist_data)} samples.")
+
+# Returns 4 numpy arrays: X_train, y_train, X_test, y_test
+X_train, y_train, X_test, y_test = load_dataset("./mnist_data")
+print(f"Training samples: {X_train.shape[0]}")  # 60000
 ```
 
 ## Architecture
 
 The system is modularized to separate concerns: data handling, model definition, core training logic, and the command-line interface.
 
-The flow is orchestrated by `ane_trainer/__main__.py` which invokes `ane_trainer/cli.py`. The CLI calls `ane_trainer/core.py`, which manages the training loop. This loop relies on `ane_trainer/data.py` for input and `ane_trainer/models.py` for network structure. The critical hardware interaction happens within `ane_trainer/core.py` via the `ane_forward_pass` function, which interfaces with the underlying ANE APIs.
+The flow is orchestrated by `ane_trainer/__main__.py` which invokes `ane_trainer/cli.py`. The CLI calls `ane_trainer/core.py`, which manages the training loop. This loop relies on `ane_trainer/data.py` for input and `ane_trainer/models.py` for network structure. The `ane_forward_pass` function in `ane_trainer/core.py` provides the hardware abstraction layer, with Apple Silicon detection via `ane_trainer/utils.py` (ANE path is currently a placeholder; all execution falls back to CPU).
 
 ```mermaid
 graph TD
     A[CLI: ane_trainer/cli.py] --> B(Core Logic: ane_trainer/core.py);
     B --> C{Data Handling: ane_trainer/data.py};
     B --> D{Model Definition: ane_trainer/models.py};
-    B --> E[ANE Hardware Interface];
-    C --> B;
-    D --> B;
-    E --> B;
+    B --> E[Utils: ane_trainer/utils.py];
+    E -->|is_apple_silicon| F[CPU Fallback -- ANE placeholder];
 ```
 
 ## API Reference
 
-### `ane_trainer.data.load_dataset(name: str)`
-Fetches and prepares the specified dataset (e.g., 'mnist').
+### `ane_trainer.data.load_dataset(dataset_path: str) -> Tuple[ndarray, ndarray, ndarray, ndarray]`
+Downloads (if needed) and loads MNIST from the given filesystem path.
 
-*Returns:* A data loader object.
+*Args:* `dataset_path` -- directory where MNIST data is stored/cached (created if missing).
 
-### `ane_trainer.models.build_model(input_size: int, output_size: int)`
-Constructs a standard, trainable neural network structure.
+*Returns:* `(X_train, y_train, X_test, y_test)` -- numpy arrays. Images are float32 normalized to [0, 1], labels are int64 in [0, 9].
 
-*Returns:* A PyTorch/TorchVision compatible model instance.
+### `ane_trainer.models.build_model(input_size: int, hidden_size: int, output_size: int) -> torch.nn.Module`
+Constructs a 2-layer feedforward network (Linear -> ReLU -> Linear). All three arguments are required.
 
-### `ane_trainer.core.ane_forward_pass(model, input_tensor)`
-Executes the forward pass of the model specifically targeting the ANE hardware path.
+*Returns:* A `SimpleNN` instance (subclass of `torch.nn.Module`).
 
-*Returns:* The output tensor from the ANE execution.
+### `ane_trainer.core.train_step(model, x, y, optimizer, loss_fn) -> float`
+Performs one training iteration: forward pass, loss, backward pass, optimizer step.
+
+*Args:* `model` (Module), `x` (ndarray float32, shape `(batch, 784)`), `y` (ndarray int64, shape `(batch,)`), `optimizer` (Optimizer), `loss_fn` (Module).
+
+*Returns:* Scalar loss value as `float`.
+
+### `ane_trainer.core.ane_forward_pass(model, x) -> ndarray`
+Runs inference with Apple Silicon detection. Currently falls back to CPU in all cases (ANE path is a placeholder).
+
+*Args:* `model` (Module in eval mode), `x` (ndarray float32, shape `(batch, 784)`).
+
+*Returns:* Output logits as ndarray float32, shape `(batch, 10)`.
+
+### `ane_trainer.utils.is_apple_silicon() -> bool`
+Returns `True` if running on Darwin with an ARM64 processor.
 
 ## Research Background
 
